@@ -1,0 +1,68 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper function to check if user is authenticated
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    // Helper function to check if user owns the resource
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+    
+    // Users collection - users can read/write their own data
+    match /users/{userId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
+      allow update, delete: if isSignedIn() && isOwner(userId);
+    }
+    
+    // Customers collection - authenticated users can CRUD
+    match /customers/{customerId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Brokers collection - authenticated users can CRUD
+    match /brokers/{brokerId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Fabric Qualities collection - authenticated users can CRUD
+    match /fabricQualities/{qualityId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Challans collection - authenticated users can CRUD
+    match /challans/{challanId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Invoices collection - authenticated users can CRUD
+    match /invoices/{invoiceId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Templates collection - authenticated users can CRUD
+    match /templates/{templateId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Settings collection - authenticated users can access
+    match /settings/{settingId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Company info collection - authenticated users can access
+    match /company/{companyId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    // Deny all other access by default
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
