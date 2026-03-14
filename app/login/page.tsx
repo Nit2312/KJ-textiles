@@ -5,6 +5,20 @@ export const metadata = {
   description: 'Sign in to your KJ Textile ERP account',
 };
 
-export default function LoginPage() {
-  return <LoginForm />;
+type LoginPageProps = {
+  searchParams?: Promise<{
+    mode?: string;
+    redirect?: string;
+  }>;
+};
+
+export default async function LoginPage({ searchParams }: LoginPageProps) {
+  const params = await searchParams;
+
+  return (
+    <LoginForm
+      initialMode={params?.mode === 'signup' ? 'signup' : 'signin'}
+      redirectUrl={params?.redirect || '/dashboard'}
+    />
+  );
 }

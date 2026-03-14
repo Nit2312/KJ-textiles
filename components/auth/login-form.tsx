@@ -1,24 +1,30 @@
 'use client';
 
 import { useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { useAuth } from '@/contexts/auth-context';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { toast } from 'sonner';
 
-export function LoginForm() {
+type LoginFormProps = {
+  initialMode?: 'signin' | 'signup';
+  redirectUrl?: string;
+};
+
+export function LoginForm({
+  initialMode = 'signin',
+  redirectUrl = '/dashboard',
+}: LoginFormProps) {
   const router = useRouter();
-  const searchParams = useSearchParams();
   const { login, register } = useAuth();
   const [isLoading, setIsLoading] = useState(false);
-  const [isSignUp, setIsSignUp] = useState(false);
+  const [isSignUp, setIsSignUp] = useState(initialMode === 'signup');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
-  const isRegisterMode = searchParams.get('mode') === 'signup';
-  const redirectUrl = searchParams.get('redirect') || '/dashboard';
+  const isRegisterMode = isSignUp;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
