@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Invoice, Customer } from '@/types';
 import { Plus } from 'lucide-react';
-import { getInvoices, deleteInvoice, getCustomers } from '@/lib/firestore';
+import { getInvoicesPage, deleteInvoice, getCustomers } from '@/lib/firestore';
 import { toast } from 'sonner';
 import {
   Table,
@@ -22,25 +22,44 @@ export default function InvoicesPage() {
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [cursor, setCursor] = useState<any>(null);
 
   useEffect(() => {
-    loadInvoices();
+    loadFirstPage();
   }, []);
 
-  const loadInvoices = async () => {
+  const loadFirstPage = async () => {
     try {
       setIsLoading(true);
-      const [invoiceData, customerData] = await Promise.all([
-        getInvoices(),
-        getCustomers()
-      ]);
-      setInvoices(invoiceData);
+      const [page, customerData] = await Promise.all([getInvoicesPage(50, null), getCustomers()]);
+      setInvoices(page.items);
       setCustomers(customerData);
+      setCursor(page.cursor);
+      setHasMore(page.hasMore);
     } catch (error: any) {
       const errorMessage = error?.message || 'Failed to load invoices. Please try again.';
       toast.error(errorMessage);
     } finally {
       setIsLoading(false);
+    }
+  };
+
+  const loadMore = async () => {
+    if (!hasMore || isLoadingMore) return;
+
+    try {
+      setIsLoadingMore(true);
+      const page = await getInvoicesPage(50, cursor);
+      setInvoices((prev) => [...prev, ...page.items]);
+      setCursor(page.cursor);
+      setHasMore(page.hasMore);
+    } catch (error: any) {
+      const errorMessage = error?.message || 'Failed to load more invoices. Please try again.';
+      toast.error(errorMessage);
+    } finally {
+      setIsLoadingMore(false);
     }
   };
 
@@ -54,7 +73,7 @@ export default function InvoicesPage() {
     
     try {
       await deleteInvoice(id);
-      setInvoices(invoices.filter((i) => i.id !== id));
+      setInvoices((prev) => prev.filter((i) => i.id !== id));
       toast.success('Invoice deleted successfully!');
     } catch (error: any) {
       const errorMessage = error?.message || 'Failed to delete invoice. Please try again.';
@@ -79,7 +98,9 @@ export default function InvoicesPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>All Invoices ({invoices.length})</CardTitle>
+          <CardTitle>
+            All Invoices ({invoices.length}){hasMore ? ' • showing latest' : ''}
+          </CardTitle>
         </CardHeader>
         <CardContent>
           <div className="overflow-x-auto">
@@ -150,6 +171,14 @@ export default function InvoicesPage() {
               </TableBody>
             </Table>
           </div>
+
+          {hasMore && (
+            <div className="mt-4 flex justify-center">
+              <Button variant="outline" onClick={loadMore} disabled={isLoadingMore}>
+                {isLoadingMore ? 'Loading…' : 'Load more'}
+              </Button>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>

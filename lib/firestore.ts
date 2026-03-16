@@ -7,12 +7,19 @@ import {
   doc,
   getDocs,
   getDoc,
+  getCountFromServer,
+  getAggregateFromServer,
   query,
   where,
   orderBy,
+  limit,
+  startAfter,
+  documentId,
+  sum,
   Timestamp,
   Query,
   DocumentData,
+  QueryDocumentSnapshot,
 } from 'firebase/firestore';
 import { Customer, Broker, FabricQuality, Challan, Invoice, Template } from '@/types';
 
@@ -56,6 +63,68 @@ function getFirestoreErrorMessage(error: any, operation: string): string {
   }
 }
 
+const TRANSIENT_FIRESTORE_CODES = new Set([
+  'unavailable',
+  'deadline-exceeded',
+  'resource-exhausted',
+  'internal',
+  'cancelled',
+  'unknown',
+]);
+
+async function withRetry<T>(operation: string, fn: () => Promise<T>): Promise<T> {
+  const maxAttempts = 3;
+
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const start = typeof performance !== 'undefined' ? performance.now() : 0;
+      const result = await fn();
+      if (process.env.NODE_ENV !== 'production' && typeof performance !== 'undefined') {
+        const ms = Math.round(performance.now() - start);
+        // eslint-disable-next-line no-console
+        console.debug(`[firestore] ${operation} (${ms}ms)`);
+      }
+      return result;
+    } catch (error: any) {
+      lastError = error;
+
+      const code = error?.code || '';
+      const isTransient = TRANSIENT_FIRESTORE_CODES.has(code);
+      if (!isTransient || attempt === maxAttempts) break;
+
+      const baseDelayMs = 250;
+      const backoffMs = baseDelayMs * Math.pow(2, attempt - 1);
+      const jitterMs = Math.floor(Math.random() * 150);
+      await new Promise((r) => setTimeout(r, backoffMs + jitterMs));
+    }
+  }
+
+  throw new Error(getFirestoreErrorMessage(lastError, operation));
+}
+
+type CachedPromise<T> = { expiresAt: number; promise: Promise<T> };
+const READ_CACHE = new Map<string, CachedPromise<any>>();
+
+function cachedRead<T>(key: string, ttlMs: number, loader: () => Promise<T>): Promise<T> {
+  const now = Date.now();
+  const existing = READ_CACHE.get(key) as CachedPromise<T> | undefined;
+  if (existing && existing.expiresAt > now) return existing.promise;
+
+  const promise = loader().catch((err) => {
+    READ_CACHE.delete(key);
+    throw err;
+  });
+  READ_CACHE.set(key, { expiresAt: now + ttlMs, promise });
+  return promise;
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 // Customers
 export async function addCustomer(data: Omit<Customer, 'id'>): Promise<string> {
   try {
@@ -63,6 +132,8 @@ export async function addCustomer(data: Omit<Customer, 'id'>): Promise<string> {
       ...data,
       createdAt: Timestamp.now(),
     });
+    READ_CACHE.delete('customers:all');
+    READ_CACHE.delete('dashboard:snapshot');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'add customer'));
@@ -71,14 +142,18 @@ export async function addCustomer(data: Omit<Customer, 'id'>): Promise<string> {
 
 export async function getCustomers(): Promise<Customer[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'customers'), orderBy('createdAt', 'desc'))
-    );
-    return querySnapshot.docs.map((doc) => ({
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() || new Date(),
-      id: doc.id,
-    })) as Customer[];
+    return await cachedRead('customers:all', 30_000, async () => {
+      return withRetry('load customers', async () => {
+        const querySnapshot = await getDocs(
+          query(collection(db, 'customers'), orderBy('createdAt', 'desc'))
+        );
+        return querySnapshot.docs.map((doc) => ({
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate() || new Date(),
+          id: doc.id,
+        })) as Customer[];
+      });
+    });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load customers'));
   }
@@ -86,7 +161,7 @@ export async function getCustomers(): Promise<Customer[]> {
 
 export async function getCustomerById(id: string): Promise<Customer | null> {
   try {
-    const docSnap = await getDoc(doc(db, 'customers', id));
+    const docSnap = await withRetry('load customer', () => getDoc(doc(db, 'customers', id)));
     if (docSnap.exists()) {
       return {
         ...docSnap.data(),
@@ -102,7 +177,9 @@ export async function getCustomerById(id: string): Promise<Customer | null> {
 
 export async function updateCustomer(id: string, data: Partial<Customer>): Promise<void> {
   try {
-    await updateDoc(doc(db, 'customers', id), data);
+    await withRetry('update customer', () => updateDoc(doc(db, 'customers', id), data));
+    READ_CACHE.delete('customers:all');
+    READ_CACHE.delete('dashboard:snapshot');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update customer'));
   }
@@ -110,7 +187,9 @@ export async function updateCustomer(id: string, data: Partial<Customer>): Promi
 
 export async function deleteCustomer(id: string): Promise<void> {
   try {
-    await deleteDoc(doc(db, 'customers', id));
+    await withRetry('delete customer', () => deleteDoc(doc(db, 'customers', id)));
+    READ_CACHE.delete('customers:all');
+    READ_CACHE.delete('dashboard:snapshot');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'delete customer'));
   }
@@ -123,6 +202,7 @@ export async function addBroker(data: Omit<Broker, 'id'>): Promise<string> {
       ...data,
       createdAt: Timestamp.now(),
     });
+    READ_CACHE.delete('brokers:all');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'add broker'));
@@ -131,14 +211,18 @@ export async function addBroker(data: Omit<Broker, 'id'>): Promise<string> {
 
 export async function getBrokers(): Promise<Broker[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'brokers'), orderBy('createdAt', 'desc'))
-    );
-    return querySnapshot.docs.map((doc) => ({
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() || new Date(),
-      id: doc.id,
-    })) as Broker[];
+    return await cachedRead('brokers:all', 30_000, async () => {
+      return withRetry('load brokers', async () => {
+        const querySnapshot = await getDocs(
+          query(collection(db, 'brokers'), orderBy('createdAt', 'desc'))
+        );
+        return querySnapshot.docs.map((doc) => ({
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate() || new Date(),
+          id: doc.id,
+        })) as Broker[];
+      });
+    });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load brokers'));
   }
@@ -146,7 +230,7 @@ export async function getBrokers(): Promise<Broker[]> {
 
 export async function getBrokerById(id: string): Promise<Broker | null> {
   try {
-    const docSnap = await getDoc(doc(db, 'brokers', id));
+    const docSnap = await withRetry('load broker', () => getDoc(doc(db, 'brokers', id)));
     if (docSnap.exists()) {
       return {
         ...docSnap.data(),
@@ -162,7 +246,8 @@ export async function getBrokerById(id: string): Promise<Broker | null> {
 
 export async function updateBroker(id: string, data: Partial<Broker>): Promise<void> {
   try {
-    await updateDoc(doc(db, 'brokers', id), data);
+    await withRetry('update broker', () => updateDoc(doc(db, 'brokers', id), data));
+    READ_CACHE.delete('brokers:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update broker'));
   }
@@ -170,7 +255,8 @@ export async function updateBroker(id: string, data: Partial<Broker>): Promise<v
 
 export async function deleteBroker(id: string): Promise<void> {
   try {
-    await deleteDoc(doc(db, 'brokers', id));
+    await withRetry('delete broker', () => deleteDoc(doc(db, 'brokers', id)));
+    READ_CACHE.delete('brokers:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'delete broker'));
   }
@@ -183,6 +269,7 @@ export async function addFabricQuality(data: Omit<FabricQuality, 'id'>): Promise
       ...data,
       createdAt: Timestamp.now(),
     });
+    READ_CACHE.delete('fabricQualities:all');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'add fabric quality'));
@@ -191,14 +278,18 @@ export async function addFabricQuality(data: Omit<FabricQuality, 'id'>): Promise
 
 export async function getFabricQualities(): Promise<FabricQuality[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'fabricQualities'), orderBy('createdAt', 'desc'))
-    );
-    return querySnapshot.docs.map((doc) => ({
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() || new Date(),
-      id: doc.id,
-    })) as FabricQuality[];
+    return await cachedRead('fabricQualities:all', 60_000, async () => {
+      return withRetry('load fabric qualities', async () => {
+        const querySnapshot = await getDocs(
+          query(collection(db, 'fabricQualities'), orderBy('createdAt', 'desc'))
+        );
+        return querySnapshot.docs.map((doc) => ({
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate() || new Date(),
+          id: doc.id,
+        })) as FabricQuality[];
+      });
+    });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load fabric qualities'));
   }
@@ -206,7 +297,8 @@ export async function getFabricQualities(): Promise<FabricQuality[]> {
 
 export async function updateFabricQuality(id: string, data: Partial<FabricQuality>): Promise<void> {
   try {
-    await updateDoc(doc(db, 'fabricQualities', id), data);
+    await withRetry('update fabric quality', () => updateDoc(doc(db, 'fabricQualities', id), data));
+    READ_CACHE.delete('fabricQualities:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update fabric quality'));
   }
@@ -214,7 +306,8 @@ export async function updateFabricQuality(id: string, data: Partial<FabricQualit
 
 export async function deleteFabricQuality(id: string): Promise<void> {
   try {
-    await deleteDoc(doc(db, 'fabricQualities', id));
+    await withRetry('delete fabric quality', () => deleteDoc(doc(db, 'fabricQualities', id)));
+    READ_CACHE.delete('fabricQualities:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'delete fabric quality'));
   }
@@ -248,6 +341,8 @@ export async function addChallan(data: Omit<Challan, 'id' | 'number'>): Promise<
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
     });
+    READ_CACHE.delete('challans:all');
+    READ_CACHE.delete('dashboard:snapshot');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'create challan'));
@@ -256,19 +351,23 @@ export async function addChallan(data: Omit<Challan, 'id' | 'number'>): Promise<
 
 export async function getChallans(): Promise<Challan[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'challans'), orderBy('createdAt', 'desc'))
-    );
-    return querySnapshot.docs.map((doc) => {
-      const data = doc.data();
-      return {
-        ...data,
-        challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
-        date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
-        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
-        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
-        id: doc.id,
-      } as any as Challan;
+    return await cachedRead('challans:all', 15_000, async () => {
+      return withRetry('load challans', async () => {
+        const querySnapshot = await getDocs(
+          query(collection(db, 'challans'), orderBy('createdAt', 'desc'))
+        );
+        return querySnapshot.docs.map((doc) => {
+          const data = doc.data();
+          return {
+            ...data,
+            challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+            date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+            createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+            updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+            id: doc.id,
+          } as any as Challan;
+        });
+      });
     });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load challans'));
@@ -277,7 +376,7 @@ export async function getChallans(): Promise<Challan[]> {
 
 export async function getChallanById(id: string): Promise<Challan | null> {
   try {
-    const docSnap = await getDoc(doc(db, 'challans', id));
+    const docSnap = await withRetry('load challan', () => getDoc(doc(db, 'challans', id)));
     if (docSnap.exists()) {
       const data = docSnap.data();
       return {
@@ -325,7 +424,9 @@ export async function updateChallan(id: string, data: Partial<Challan>): Promise
     // Always update the updatedAt timestamp
     dataToUpdate.updatedAt = Timestamp.now();
     
-    await updateDoc(doc(db, 'challans', id), dataToUpdate);
+    await withRetry('update challan', () => updateDoc(doc(db, 'challans', id), dataToUpdate));
+    READ_CACHE.delete('challans:all');
+    READ_CACHE.delete('dashboard:snapshot');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update challan'));
   }
@@ -338,7 +439,9 @@ export async function deleteChallan(id: string): Promise<void> {
   
   try {
     console.log('Deleting challan with ID:', id);
-    await deleteDoc(doc(db, 'challans', id));
+    await withRetry('delete challan', () => deleteDoc(doc(db, 'challans', id)));
+    READ_CACHE.delete('challans:all');
+    READ_CACHE.delete('dashboard:snapshot');
     console.log('Challan deleted successfully');
   } catch (error: any) {
     console.error('Firestore delete error:', error);
@@ -386,6 +489,8 @@ export async function addInvoice(data: Omit<Invoice, 'id' | 'number'>): Promise<
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
     });
+    READ_CACHE.delete('invoices:all');
+    READ_CACHE.delete('dashboard:snapshot');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'create invoice'));
@@ -393,21 +498,25 @@ export async function addInvoice(data: Omit<Invoice, 'id' | 'number'>): Promise<
 }
 
 export async function getInvoices(): Promise<Invoice[]> {
-  const querySnapshot = await getDocs(
-    query(collection(db, 'invoices'), orderBy('createdAt', 'desc'))
-  );
-  return querySnapshot.docs.map((doc) => {
-    const data = doc.data();
-    return {
-      ...data,
-      invoiceDate: data.invoiceDate?.toDate ? data.invoiceDate.toDate() : (data.invoiceDate || new Date()),
-      challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
-      dueDate: data.dueDate?.toDate ? data.dueDate.toDate() : (data.dueDate || new Date()),
-      date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
-      createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
-      updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
-      id: doc.id,
-    } as any as Invoice;
+  return await cachedRead('invoices:all', 15_000, async () => {
+    return withRetry('load invoices', async () => {
+      const querySnapshot = await getDocs(
+        query(collection(db, 'invoices'), orderBy('createdAt', 'desc'))
+      );
+      return querySnapshot.docs.map((doc) => {
+        const data = doc.data();
+        return {
+          ...data,
+          invoiceDate: data.invoiceDate?.toDate ? data.invoiceDate.toDate() : (data.invoiceDate || new Date()),
+          challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+          dueDate: data.dueDate?.toDate ? data.dueDate.toDate() : (data.dueDate || new Date()),
+          date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+          createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+          updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+          id: doc.id,
+        } as any as Invoice;
+      });
+    });
   });
 }
 
@@ -471,7 +580,9 @@ export async function updateInvoice(id: string, data: Partial<Invoice>): Promise
     // Always update the updatedAt timestamp
     dataToUpdate.updatedAt = Timestamp.now();
     
-    await updateDoc(doc(db, 'invoices', id), dataToUpdate);
+    await withRetry('update invoice', () => updateDoc(doc(db, 'invoices', id), dataToUpdate));
+    READ_CACHE.delete('invoices:all');
+    READ_CACHE.delete('dashboard:snapshot');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update invoice'));
   }
@@ -484,7 +595,9 @@ export async function deleteInvoice(id: string): Promise<void> {
   
   try {
     console.log('Deleting invoice with ID:', id);
-    await deleteDoc(doc(db, 'invoices', id));
+    await withRetry('delete invoice', () => deleteDoc(doc(db, 'invoices', id)));
+    READ_CACHE.delete('invoices:all');
+    READ_CACHE.delete('dashboard:snapshot');
     console.log('Invoice deleted successfully');
   } catch (error: any) {
     console.error('Firestore delete error:', error);
@@ -514,6 +627,7 @@ export async function addTemplate(data: Omit<Template, 'id'>): Promise<string> {
       createdAt: Timestamp.now(),
       updatedAt: Timestamp.now(),
     });
+    READ_CACHE.delete('templates:all');
     return docRef.id;
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'create template'));
@@ -522,15 +636,17 @@ export async function addTemplate(data: Omit<Template, 'id'>): Promise<string> {
 
 export async function getTemplatesByUser(userId: string): Promise<Template[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'templates'), where('userId', '==', userId))
-    );
-    return querySnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() || new Date(),
-      updatedAt: doc.data().updatedAt?.toDate() || new Date(),
-    })) as Template[];
+    return withRetry('load templates', async () => {
+      const querySnapshot = await getDocs(
+        query(collection(db, 'templates'), where('userId', '==', userId))
+      );
+      return querySnapshot.docs.map((doc) => ({
+        id: doc.id,
+        ...doc.data(),
+        createdAt: doc.data().createdAt?.toDate() || new Date(),
+        updatedAt: doc.data().updatedAt?.toDate() || new Date(),
+      })) as Template[];
+    });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load templates'));
   }
@@ -539,15 +655,19 @@ export async function getTemplatesByUser(userId: string): Promise<Template[]> {
 // Alias for getting all templates (same as getTemplatesByUser)
 export async function getTemplates(): Promise<Template[]> {
   try {
-    const querySnapshot = await getDocs(
-      query(collection(db, 'templates'), orderBy('createdAt', 'desc'))
-    );
-    return querySnapshot.docs.map((doc) => ({
-      id: doc.id,
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate() || new Date(),
-      updatedAt: doc.data().updatedAt?.toDate() || new Date(),
-    })) as Template[];
+    return await cachedRead('templates:all', 30_000, async () => {
+      return withRetry('load templates', async () => {
+        const querySnapshot = await getDocs(
+          query(collection(db, 'templates'), orderBy('createdAt', 'desc'))
+        );
+        return querySnapshot.docs.map((doc) => ({
+          id: doc.id,
+          ...doc.data(),
+          createdAt: doc.data().createdAt?.toDate() || new Date(),
+          updatedAt: doc.data().updatedAt?.toDate() || new Date(),
+        })) as Template[];
+      });
+    });
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'load templates'));
   }
@@ -573,10 +693,11 @@ export async function updateTemplate(id: string, data: Partial<Template>): Promi
     // Strip id, createdAt, updatedAt — server handles timestamps
     const { id: _id, createdAt: _ca, updatedAt: _ua, ...rest } = data as any;
     const clean = sanitize(rest);
-    await updateDoc(doc(db, 'templates', id), {
+    await withRetry('update template', () => updateDoc(doc(db, 'templates', id), {
       ...clean,
       updatedAt: Timestamp.now(),
-    });
+    }));
+    READ_CACHE.delete('templates:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'update template'));
   }
@@ -584,10 +705,222 @@ export async function updateTemplate(id: string, data: Partial<Template>): Promi
 
 export async function deleteTemplate(id: string): Promise<void> {
   try {
-    await deleteDoc(doc(db, 'templates', id));
+    await withRetry('delete template', () => deleteDoc(doc(db, 'templates', id)));
+    READ_CACHE.delete('templates:all');
   } catch (error: any) {
     throw new Error(getFirestoreErrorMessage(error, 'delete template'));
   }
+}
+
+export type PageResult<T> = {
+  items: T[];
+  cursor: QueryDocumentSnapshot<DocumentData> | null;
+  hasMore: boolean;
+};
+
+export async function getInvoicesPage(
+  pageSize = 50,
+  cursor?: QueryDocumentSnapshot<DocumentData> | null
+): Promise<PageResult<Invoice>> {
+  return withRetry('load invoices page', async () => {
+    const base = query(collection(db, 'invoices'), orderBy('createdAt', 'desc'), limit(pageSize));
+    const q = cursor ? query(collection(db, 'invoices'), orderBy('createdAt', 'desc'), startAfter(cursor), limit(pageSize)) : base;
+
+    const querySnapshot = await getDocs(q);
+    const items = querySnapshot.docs.map((docSnap) => {
+      const data = docSnap.data();
+      return {
+        ...data,
+        invoiceDate: data.invoiceDate?.toDate ? data.invoiceDate.toDate() : (data.invoiceDate || new Date()),
+        challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+        dueDate: data.dueDate?.toDate ? data.dueDate.toDate() : (data.dueDate || new Date()),
+        date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+        id: docSnap.id,
+      } as any as Invoice;
+    });
+
+    const nextCursor = querySnapshot.docs.length ? querySnapshot.docs[querySnapshot.docs.length - 1] : null;
+    return { items, cursor: nextCursor, hasMore: querySnapshot.docs.length === pageSize };
+  });
+}
+
+export async function getChallansPage(
+  pageSize = 50,
+  cursor?: QueryDocumentSnapshot<DocumentData> | null
+): Promise<PageResult<Challan>> {
+  return withRetry('load challans page', async () => {
+    const base = query(collection(db, 'challans'), orderBy('createdAt', 'desc'), limit(pageSize));
+    const q = cursor ? query(collection(db, 'challans'), orderBy('createdAt', 'desc'), startAfter(cursor), limit(pageSize)) : base;
+
+    const querySnapshot = await getDocs(q);
+    const items = querySnapshot.docs.map((docSnap) => {
+      const data = docSnap.data();
+      return {
+        ...data,
+        challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+        date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+        id: docSnap.id,
+      } as any as Challan;
+    });
+
+    const nextCursor = querySnapshot.docs.length ? querySnapshot.docs[querySnapshot.docs.length - 1] : null;
+    return { items, cursor: nextCursor, hasMore: querySnapshot.docs.length === pageSize };
+  });
+}
+
+export type DashboardSnapshot = {
+  counts: { customers: number; challans: number; invoices: number };
+  totals: { sales: number; gst: number; meters: number };
+  monthly: { sales: number; gst: number };
+  recentInvoices: Invoice[];
+  recentChallans: Challan[];
+  customersById: Record<string, Customer>;
+};
+
+export async function getCustomersByIds(ids: string[]): Promise<Customer[]> {
+  const unique = Array.from(new Set(ids.filter((x) => typeof x === 'string' && x.trim() !== '')));
+  if (!unique.length) return [];
+
+  return withRetry('load customers by ids', async () => {
+    try {
+      const batches = chunk(unique, 10);
+      const snapshots = await Promise.all(
+        batches.map((batch) =>
+          getDocs(query(collection(db, 'customers'), where(documentId(), 'in', batch)))
+        )
+      );
+      return snapshots
+        .flatMap((s) => s.docs)
+        .map((docSnap) => ({
+          ...docSnap.data(),
+          createdAt: docSnap.data().createdAt?.toDate?.() || new Date(),
+          id: docSnap.id,
+        })) as Customer[];
+    } catch {
+      // Fallback if `in` query isn't available for some reason.
+      const snaps = await Promise.all(unique.map((id) => getDoc(doc(db, 'customers', id))));
+      return snaps
+        .filter((s) => s.exists())
+        .map((s) => ({
+          ...s.data(),
+          createdAt: s.data().createdAt?.toDate?.() || new Date(),
+          id: s.id,
+        })) as Customer[];
+    }
+  });
+}
+
+export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
+  return cachedRead('dashboard:snapshot', 10_000, async () => {
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const nextMonthStart = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+    const monthStartTs = Timestamp.fromDate(monthStart);
+    const nextMonthStartTs = Timestamp.fromDate(nextMonthStart);
+
+    const customersCol = collection(db, 'customers');
+    const challansCol = collection(db, 'challans');
+    const invoicesCol = collection(db, 'invoices');
+
+    const [customersCount, challansCount, invoicesCount] = await Promise.all([
+      withRetry('count customers', async () => (await getCountFromServer(query(customersCol))).data().count),
+      withRetry('count challans', async () => (await getCountFromServer(query(challansCol))).data().count),
+      withRetry('count invoices', async () => (await getCountFromServer(query(invoicesCol))).data().count),
+    ]);
+
+    // Aggregate totals (best effort; falls back gracefully if some fields are missing)
+    const [totalsAgg, monthlyAgg] = await Promise.all([
+      withRetry('aggregate totals', async () => {
+        const snap = await getAggregateFromServer(query(invoicesCol), {
+          sales: sum('grandTotal'),
+          cgst: sum('cgstAmount'),
+          sgst: sum('sgstAmount'),
+          igst: sum('igstAmount'),
+        });
+        return snap.data() as any;
+      }).catch(() => ({ sales: 0, cgst: 0, sgst: 0, igst: 0 })),
+      withRetry('aggregate monthly', async () => {
+        const monthQuery = query(
+          invoicesCol,
+          where('createdAt', '>=', monthStartTs),
+          where('createdAt', '<', nextMonthStartTs)
+        );
+        const snap = await getAggregateFromServer(monthQuery, {
+          sales: sum('grandTotal'),
+          cgst: sum('cgstAmount'),
+          sgst: sum('sgstAmount'),
+          igst: sum('igstAmount'),
+        });
+        return snap.data() as any;
+      }).catch(() => ({ sales: 0, cgst: 0, sgst: 0, igst: 0 })),
+    ]);
+
+    const metersAgg = await withRetry('aggregate meters', async () => {
+      const snap = await getAggregateFromServer(query(challansCol), { meters: sum('totalMeters') });
+      return (snap.data() as any).meters ?? 0;
+    }).catch(() => 0);
+
+    const [recentInvoicesSnap, recentChallansSnap] = await Promise.all([
+      withRetry('load recent invoices', () =>
+        getDocs(query(invoicesCol, orderBy('createdAt', 'desc'), limit(5)))
+      ),
+      withRetry('load recent challans', () =>
+        getDocs(query(challansCol, orderBy('createdAt', 'desc'), limit(5)))
+      ),
+    ]);
+
+    const recentInvoices = recentInvoicesSnap.docs.map((docSnap) => {
+      const data = docSnap.data();
+      return {
+        ...data,
+        invoiceDate: data.invoiceDate?.toDate ? data.invoiceDate.toDate() : (data.invoiceDate || new Date()),
+        challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+        dueDate: data.dueDate?.toDate ? data.dueDate.toDate() : (data.dueDate || new Date()),
+        date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+        id: docSnap.id,
+      } as any as Invoice;
+    });
+
+    const recentChallans = recentChallansSnap.docs.map((docSnap) => {
+      const data = docSnap.data();
+      return {
+        ...data,
+        challanDate: data.challanDate?.toDate ? data.challanDate.toDate() : (data.challanDate || new Date()),
+        date: data.date?.toDate ? data.date.toDate() : (data.date || new Date()),
+        createdAt: data.createdAt?.toDate ? data.createdAt.toDate() : (data.createdAt || new Date()),
+        updatedAt: data.updatedAt?.toDate ? data.updatedAt.toDate() : (data.updatedAt || new Date()),
+        id: docSnap.id,
+      } as any as Challan;
+    });
+
+    const recentCustomerIds = [
+      ...recentInvoices.map((i: any) => i.customerId).filter(Boolean),
+      ...recentChallans.map((c: any) => c.customerId).filter(Boolean),
+    ];
+
+    const customers = await getCustomersByIds(recentCustomerIds);
+    const customersById = Object.fromEntries(customers.map((c) => [c.id, c]));
+
+    const totalSales = Number(totalsAgg.sales ?? 0) || 0;
+    const totalGST = Number(totalsAgg.cgst ?? 0) + Number(totalsAgg.sgst ?? 0) + Number(totalsAgg.igst ?? 0);
+    const monthlySales = Number(monthlyAgg.sales ?? 0) || 0;
+    const monthlyGST = Number(monthlyAgg.cgst ?? 0) + Number(monthlyAgg.sgst ?? 0) + Number(monthlyAgg.igst ?? 0);
+
+    return {
+      counts: { customers: customersCount, challans: challansCount, invoices: invoicesCount },
+      totals: { sales: totalSales, gst: totalGST, meters: Number(metersAgg ?? 0) || 0 },
+      monthly: { sales: monthlySales, gst: monthlyGST },
+      recentInvoices,
+      recentChallans,
+      customersById,
+    };
+  });
 }
 
 // Aliases for backward compatibility with component imports

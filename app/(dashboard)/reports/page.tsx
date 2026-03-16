@@ -4,32 +4,47 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Challan, Invoice } from '@/types';
-import { getChallans, getInvoices } from '@/lib/firestore';
+import { getChallans, getInvoices, getDashboardSnapshot } from '@/lib/firestore';
 import { generateReportExcel } from '@/lib/excel-generator';
 import { Download, FileText } from 'lucide-react';
 
 export default function ReportsPage() {
   const [challans, setChallans] = useState<Challan[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingStats, setIsLoadingStats] = useState(false);
+  const [isLoadingData, setIsLoadingData] = useState(false);
+  const [stats, setStats] = useState<{ invoiceCount: number; challanCount: number; totalSales: number; totalGST: number } | null>(null);
 
   useEffect(() => {
-    loadReportData();
+    loadStats();
   }, []);
 
-  const loadReportData = async () => {
+  const loadStats = async () => {
     try {
-      setIsLoading(true);
-      const [challanData, invoiceData] = await Promise.all([
-        getChallans(),
-        getInvoices(),
-      ]);
-      setChallans(challanData);
-      setInvoices(invoiceData);
+      setIsLoadingStats(true);
+      const snap = await getDashboardSnapshot();
+      setStats({
+        invoiceCount: snap.counts.invoices,
+        challanCount: snap.counts.challans,
+        totalSales: snap.totals.sales,
+        totalGST: snap.totals.gst,
+      });
     } catch (error) {
       console.error('Error loading reports:', error);
     } finally {
-      setIsLoading(false);
+      setIsLoadingStats(false);
+    }
+  };
+
+  const ensureDataLoaded = async () => {
+    if (invoices.length && challans.length) return;
+    try {
+      setIsLoadingData(true);
+      const [challanData, invoiceData] = await Promise.all([getChallans(), getInvoices()]);
+      setChallans(challanData);
+      setInvoices(invoiceData);
+    } finally {
+      setIsLoadingData(false);
     }
   };
 
@@ -55,12 +70,12 @@ export default function ReportsPage() {
     return 0;
   };
 
-  const totalSales = invoices.reduce((sum, inv) => sum + getInvoiceTotal(inv), 0);
-  const totalGST = invoices.reduce((sum, inv) => sum + getInvoiceGST(inv), 0);
+  const totalSales = stats?.totalSales ?? invoices.reduce((sum, inv) => sum + getInvoiceTotal(inv), 0);
+  const totalGST = stats?.totalGST ?? invoices.reduce((sum, inv) => sum + getInvoiceGST(inv), 0);
 
-  const stats = [
-    { label: 'Total Invoices', value: invoices.length },
-    { label: 'Total Challans', value: challans.length },
+  const statsArr = [
+    { label: 'Total Invoices', value: stats?.invoiceCount ?? invoices.length },
+    { label: 'Total Challans', value: stats?.challanCount ?? challans.length },
     { label: 'Total Sales', value: `₹${totalSales.toFixed(2)}` },
     { label: 'Total GST', value: `₹${totalGST.toFixed(2)}` },
   ];
@@ -73,7 +88,7 @@ export default function ReportsPage() {
       </div>
 
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-        {stats.map((stat, index) => (
+        {statsArr.map((stat, index) => (
           <Card key={index} className="p-6">
             <p className="text-sm text-gray-600 mb-2">{stat.label}</p>
             <p className="text-2xl font-bold">{stat.value}</p>
@@ -89,7 +104,9 @@ export default function ReportsPage() {
           </p>
           <Button 
             className="w-full"
-            onClick={() => {
+            disabled={isLoadingStats || isLoadingData}
+            onClick={async () => {
+              await ensureDataLoaded();
               generateReportExcel([{
                 name: 'Invoices',
                 data: invoices.map((inv: any) => ({
@@ -107,7 +124,7 @@ export default function ReportsPage() {
             }}
           >
             <Download className="w-4 h-4 mr-2" />
-            Export to Excel
+            {isLoadingData ? 'Loading…' : 'Export to Excel'}
           </Button>
         </Card>
 
@@ -118,7 +135,9 @@ export default function ReportsPage() {
           </p>
           <Button 
             className="w-full"
-            onClick={() => {
+            disabled={isLoadingStats || isLoadingData}
+            onClick={async () => {
+              await ensureDataLoaded();
               generateReportExcel([{
                 name: 'Challans',
                 data: challans.map((ch: any) => ({
@@ -134,7 +153,7 @@ export default function ReportsPage() {
             }}
           >
             <Download className="w-4 h-4 mr-2" />
-            Export to Excel
+            {isLoadingData ? 'Loading…' : 'Export to Excel'}
           </Button>
         </Card>
 
@@ -151,10 +170,10 @@ export default function ReportsPage() {
                   name: 'Summary',
                   data: [{
                     'Metric': 'Total Invoices',
-                    'Value': invoices.length
+                    'Value': stats?.invoiceCount ?? invoices.length
                   }, {
                     'Metric': 'Total Challans',
-                    'Value': challans.length
+                    'Value': stats?.challanCount ?? challans.length
                   }, {
                     'Metric': 'Total Sales (₹)',
                     'Value': totalSales.toFixed(2)

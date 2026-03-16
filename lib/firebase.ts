@@ -1,6 +1,11 @@
-import { initializeApp } from 'firebase/app';
+import { getApp, getApps, initializeApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
-import { getFirestore } from 'firebase/firestore';
+import {
+  getFirestore,
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 
 const firebaseConfig = {
@@ -12,10 +17,28 @@ const firebaseConfig = {
   appId: process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = initializeApp(firebaseConfig);
+const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
 
 export const auth = getAuth(app);
-export const db = getFirestore(app);
+
+// Prefer persistent local cache in the browser for faster subsequent loads and
+// better resilience when the network is flaky.
+export const db =
+  typeof window === 'undefined'
+    ? getFirestore(app)
+    : (() => {
+        try {
+          return initializeFirestore(app, {
+            localCache: persistentLocalCache({
+              tabManager: persistentMultipleTabManager(),
+            }),
+          });
+        } catch {
+          // Firestore may already be initialized (e.g. HMR); fall back safely.
+          return getFirestore(app);
+        }
+      })();
+
 export const storage = getStorage(app);
 
 export default app;

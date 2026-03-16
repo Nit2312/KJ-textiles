@@ -3,8 +3,7 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { getCustomers, getChallans, getInvoices } from '@/lib/firestore';
-import { Customer, Challan, Invoice } from '@/types';
+import { getDashboardSnapshot, DashboardSnapshot } from '@/lib/firestore';
 import Link from 'next/link';
 import { Users, FileText, Receipt, TrendingUp, Package, IndianRupee } from 'lucide-react';
 
@@ -43,19 +42,15 @@ function fmtCurrency(n: number): string {
 }
 
 export default function DashboardPage() {
-  const [customers, setCustomers] = useState<Customer[]>([]);
-  const [challans, setChallans] = useState<Challan[]>([]);
-  const [invoices, setInvoices] = useState<Invoice[]>([]);
+  const [snapshot, setSnapshot] = useState<DashboardSnapshot | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
     (async () => {
       try {
         setIsLoading(true);
-        const [c, ch, inv] = await Promise.all([getCustomers(), getChallans(), getInvoices()]);
-        setCustomers(c);
-        setChallans(ch);
-        setInvoices(inv);
+        const s = await getDashboardSnapshot();
+        setSnapshot(s);
       } catch (err) {
         console.error('Dashboard load error:', err);
       } finally {
@@ -65,53 +60,44 @@ export default function DashboardPage() {
   }, []);
 
   const now = new Date();
-  const thisMonth = now.getMonth();
-  const thisYear = now.getFullYear();
-
-  const monthlyInvoices = invoices.filter((inv) => {
-    const d = parseDate((inv as any).invoiceDate || (inv as any).date);
-    return d.getMonth() === thisMonth && d.getFullYear() === thisYear;
-  });
-
-  const totalSalesAllTime = invoices.reduce((s, inv) => s + getInvoiceTotal(inv), 0);
-  const totalGSTAllTime   = invoices.reduce((s, inv) => s + getInvoiceGST(inv), 0);
-  const monthlySales      = monthlyInvoices.reduce((s, inv) => s + getInvoiceTotal(inv), 0);
-  const monthlyGST        = monthlyInvoices.reduce((s, inv) => s + getInvoiceGST(inv), 0);
-
-  // Total meters dispatched across all challans
-  const totalMeters = challans.reduce((s, ch: any) => {
-    if (ch.totalMeters != null) return s + Number(ch.totalMeters);
-    if (Array.isArray(ch.rolls)) return s + ch.rolls.reduce((rs: number, r: any) => rs + Number(r.meters || 0), 0);
-    return s;
-  }, 0);
+  const counts = snapshot?.counts ?? { customers: 0, challans: 0, invoices: 0 };
+  const totals = snapshot?.totals ?? { sales: 0, gst: 0, meters: 0 };
+  const monthly = snapshot?.monthly ?? { sales: 0, gst: 0 };
 
   const statCards = [
-    { label: 'Total Customers',    value: customers.length,              sub: 'registered',       icon: Users,        color: 'text-blue-600',   bg: 'bg-blue-50',   href: '/customers' },
-    { label: 'Total Challans',     value: challans.length,               sub: 'dispatched',        icon: Package,      color: 'text-orange-600', bg: 'bg-orange-50', href: '/challans' },
-    { label: 'Total Invoices',     value: invoices.length,               sub: 'generated',         icon: Receipt,      color: 'text-purple-600', bg: 'bg-purple-50', href: '/invoices' },
-    { label: 'Total Meters',       value: totalMeters.toFixed(1) + ' m', sub: 'dispatched',        icon: FileText,     color: 'text-teal-600',   bg: 'bg-teal-50',   href: '/challans' },
-    { label: 'Total Sales',        value: fmtCurrency(totalSalesAllTime),sub: 'all time',          icon: IndianRupee,  color: 'text-green-600',  bg: 'bg-green-50',  href: '/invoices' },
-    { label: 'Total GST Collected',value: fmtCurrency(totalGSTAllTime),  sub: 'all time',          icon: TrendingUp,   color: 'text-red-600',    bg: 'bg-red-50',    href: '/reports' },
-    { label: 'This Month Sales',   value: fmtCurrency(monthlySales),     sub: now.toLocaleString('default', { month: 'long' }), icon: IndianRupee, color: 'text-green-700', bg: 'bg-green-50', href: '/invoices' },
-    { label: 'This Month GST',     value: fmtCurrency(monthlyGST),       sub: now.toLocaleString('default', { month: 'long' }), icon: TrendingUp,  color: 'text-red-700',   bg: 'bg-red-50',   href: '/reports' },
+    { label: 'Total Customers',    value: counts.customers,                 sub: 'registered',       icon: Users,        color: 'text-blue-600',   bg: 'bg-blue-50',   href: '/customers' },
+    { label: 'Total Challans',     value: counts.challans,                  sub: 'dispatched',       icon: Package,      color: 'text-orange-600', bg: 'bg-orange-50', href: '/challans' },
+    { label: 'Total Invoices',     value: counts.invoices,                  sub: 'generated',        icon: Receipt,      color: 'text-purple-600', bg: 'bg-purple-50', href: '/invoices' },
+    { label: 'Total Meters',       value: totals.meters.toFixed(1) + ' m',  sub: 'dispatched',       icon: FileText,     color: 'text-teal-600',   bg: 'bg-teal-50',   href: '/challans' },
+    { label: 'Total Sales',        value: fmtCurrency(totals.sales),        sub: 'all time',         icon: IndianRupee,  color: 'text-green-600',  bg: 'bg-green-50',  href: '/invoices' },
+    { label: 'Total GST Collected',value: fmtCurrency(totals.gst),          sub: 'all time',         icon: TrendingUp,   color: 'text-red-600',    bg: 'bg-red-50',    href: '/reports' },
+    { label: 'This Month Sales',   value: fmtCurrency(monthly.sales),       sub: now.toLocaleString('default', { month: 'long' }), icon: IndianRupee, color: 'text-green-700', bg: 'bg-green-50', href: '/invoices' },
+    { label: 'This Month GST',     value: fmtCurrency(monthly.gst),         sub: now.toLocaleString('default', { month: 'long' }), icon: TrendingUp,  color: 'text-red-700',   bg: 'bg-red-50',   href: '/reports' },
   ];
 
   // Recent records (last 5 by date)
-  const recentInvoices = [...invoices]
-    .sort((a, b) => parseDate((b as any).invoiceDate || (b as any).date).getTime() - parseDate((a as any).invoiceDate || (a as any).date).getTime())
-    .slice(0, 5);
+  const recentInvoices = snapshot?.recentInvoices ?? [];
+  const recentChallans = snapshot?.recentChallans ?? [];
 
-  const recentChallans = [...challans]
-    .sort((a, b) => parseDate((b as any).challanDate || (b as any).date).getTime() - parseDate((a as any).challanDate || (a as any).date).getTime())
-    .slice(0, 5);
-
-  const getCustomerName = (id: string) => customers.find((c) => c.id === id)?.name || customers.find((c) => c.id === id)?.businessName || id;
+  const getCustomerName = (id: string) => {
+    const c = snapshot?.customersById?.[id];
+    return c?.name || (c as any)?.businessName || id;
+  };
 
   if (isLoading) {
     return (
       <div className="p-4 md:p-8">
         <h1 className="text-2xl md:text-3xl font-bold text-gray-900 mb-2">Dashboard</h1>
         <p className="text-gray-400">Loading data…</p>
+      </div>
+    );
+  }
+
+  if (!snapshot) {
+    return (
+      <div className="p-4 md:p-8">
+        <h1 className="text-2xl md:text-3xl font-bold text-gray-900 mb-2">Dashboard</h1>
+        <p className="text-gray-500">Unable to load dashboard data. Please refresh.</p>
       </div>
     );
   }
@@ -222,4 +208,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-
