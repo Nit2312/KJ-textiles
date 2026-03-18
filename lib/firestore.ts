@@ -23,6 +23,96 @@ import {
 } from 'firebase/firestore';
 import { Customer, Broker, FabricQuality, Challan, Invoice, Template } from '@/types';
 
+function toFiniteNumber(value: unknown): number | undefined {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
+  if (typeof value !== 'string') return undefined;
+
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+
+  // Best-effort: strip currency symbols, commas, and other non-numeric chars.
+  const cleaned = trimmed.replace(/[₹,\s]/g, '').replace(/[^0-9.-]/g, '');
+  if (!cleaned) return undefined;
+
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function coerceNumberField(obj: any, key: string): void {
+  if (!obj || typeof obj !== 'object') return;
+  const v = obj[key];
+  if (v === undefined) return;
+  if (v === null) return;
+
+  const n = toFiniteNumber(v);
+  if (n === undefined) {
+    if (typeof v === 'string' && v.trim() === '') delete obj[key];
+    return;
+  }
+  obj[key] = n;
+}
+
+function coerceInvoiceNumbers(inv: any): void {
+  if (!inv || typeof inv !== 'object') return;
+
+  const topLevelNumeric = [
+    'cgstPercent',
+    'sgstPercent',
+    'igstPercent',
+    'totalAmountBeforeTax',
+    'cgstAmount',
+    'sgstAmount',
+    'igstAmount',
+    'subTotal',
+    'subtotal',
+    'roundOff',
+    'grandTotal',
+    'netRate',
+    'discountPercent',
+    'additionalCharges',
+    'totalTaka',
+    'totalMeters',
+    'basicRate',
+    'totalAmount',
+    'cgst',
+    'sgst',
+    'igst',
+  ];
+  for (const key of topLevelNumeric) coerceNumberField(inv, key);
+
+  if (Array.isArray(inv.items)) {
+    for (const item of inv.items) {
+      coerceNumberField(item, 'totalTaka');
+      coerceNumberField(item, 'meters');
+      coerceNumberField(item, 'basicRate');
+      coerceNumberField(item, 'totalAmount');
+      // Legacy aliases
+      coerceNumberField(item, 'quantity');
+      coerceNumberField(item, 'rate');
+      coerceNumberField(item, 'gst');
+    }
+  }
+}
+
+function coerceChallanNumbers(ch: any): void {
+  if (!ch || typeof ch !== 'object') return;
+  coerceNumberField(ch, 'totalTaka');
+  coerceNumberField(ch, 'totalMeters');
+  coerceNumberField(ch, 'brokerCommission');
+
+  if (Array.isArray(ch.rolls)) {
+    for (const roll of ch.rolls) coerceNumberField(roll, 'meters');
+  }
+  if (Array.isArray(ch.items)) {
+    for (const item of ch.items) {
+      coerceNumberField(item, 'quantity');
+      coerceNumberField(item, 'rate');
+      coerceNumberField(item, 'meters');
+      coerceNumberField(item, 'totalAmount');
+    }
+  }
+}
+
 // Helper function to get user-friendly Firestore error messages
 function getFirestoreErrorMessage(error: any, operation: string): string {
   const errorCode = error?.code || '';
@@ -320,6 +410,8 @@ export async function addChallan(data: Omit<Challan, 'id' | 'number'>): Promise<
 
     // Never persist a client-side id field; Firestore document id is the source of truth.
     delete dataToSave.id;
+
+    coerceChallanNumbers(dataToSave);
     
     // Convert date fields to Timestamps
     if (dataToSave.challanDate) {
@@ -400,6 +492,8 @@ export async function updateChallan(id: string, data: Partial<Challan>): Promise
     
     // Remove id field if present
     delete dataToUpdate.id;
+
+    coerceChallanNumbers(dataToUpdate);
     
     // Convert date fields to Timestamps
     if (dataToUpdate.challanDate) {
@@ -456,6 +550,8 @@ export async function addInvoice(data: Omit<Invoice, 'id' | 'number'>): Promise<
 
     // Never persist a client-side id field; Firestore document id is the source of truth.
     delete dataToSave.id;
+
+    coerceInvoiceNumbers(dataToSave);
     
     // Convert date fields to Timestamps
     if (dataToSave.invoiceDate) {
@@ -544,6 +640,8 @@ export async function updateInvoice(id: string, data: Partial<Invoice>): Promise
     
     // Remove id field if present
     delete dataToUpdate.id;
+
+    coerceInvoiceNumbers(dataToUpdate);
     
     // Convert date fields to Timestamps
     if (dataToUpdate.invoiceDate) {
@@ -832,33 +930,6 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
       withRetry('count invoices', async () => (await getCountFromServer(query(invoicesCol))).data().count),
     ]);
 
-    // Aggregate totals (best effort; falls back gracefully if some fields are missing)
-    const [totalsAgg, monthlyAgg] = await Promise.all([
-      withRetry('aggregate totals', async () => {
-        const snap = await getAggregateFromServer(query(invoicesCol), {
-          sales: sum('grandTotal'),
-          cgst: sum('cgstAmount'),
-          sgst: sum('sgstAmount'),
-          igst: sum('igstAmount'),
-        });
-        return snap.data() as any;
-      }).catch(() => ({ sales: 0, cgst: 0, sgst: 0, igst: 0 })),
-      withRetry('aggregate monthly', async () => {
-        const monthQuery = query(
-          invoicesCol,
-          where('createdAt', '>=', monthStartTs),
-          where('createdAt', '<', nextMonthStartTs)
-        );
-        const snap = await getAggregateFromServer(monthQuery, {
-          sales: sum('grandTotal'),
-          cgst: sum('cgstAmount'),
-          sgst: sum('sgstAmount'),
-          igst: sum('igstAmount'),
-        });
-        return snap.data() as any;
-      }).catch(() => ({ sales: 0, cgst: 0, sgst: 0, igst: 0 })),
-    ]);
-
     const metersAgg = await withRetry('aggregate meters', async () => {
       const snap = await getAggregateFromServer(query(challansCol), { meters: sum('totalMeters') });
       return (snap.data() as any).meters ?? 0;
@@ -872,6 +943,49 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
         getDocs(query(challansCol, orderBy('createdAt', 'desc'), limit(5)))
       ),
     ]);
+
+    const computeInvoiceTotal = (inv: any): number => {
+      if (inv?.grandTotal != null) return Number(inv.grandTotal) || 0;
+      if (inv?.totalAmountBeforeTax != null) {
+        return (
+          (Number(inv.totalAmountBeforeTax) || 0) +
+          (Number(inv.cgstAmount ?? 0) || 0) +
+          (Number(inv.sgstAmount ?? 0) || 0) +
+          (Number(inv.igstAmount ?? 0) || 0)
+        );
+      }
+      if (inv?.items?.length) {
+        return inv.items.reduce(
+          (s: number, i: any) => s + (Number(i.totalAmount) || (Number(i.quantity ?? 0) || 0) * (Number(i.rate ?? 0) || 0)),
+          0
+        );
+      }
+      return 0;
+    };
+
+    const computeInvoiceGST = (inv: any): number => {
+      const cg = Number(inv?.cgstAmount ?? 0) || 0;
+      const sg = Number(inv?.sgstAmount ?? 0) || 0;
+      const ig = Number(inv?.igstAmount ?? 0) || 0;
+      if (cg + sg + ig > 0) return cg + sg + ig;
+      if (inv?.items?.length) {
+        return inv.items.reduce(
+          (s: number, i: any) => {
+            const taxable = Number(i.totalAmount) || (Number(i.quantity ?? 0) || 0) * (Number(i.rate ?? 0) || 0);
+            return s + (taxable * ((Number(i.gst ?? 0) || 0) / 100));
+          },
+          0
+        );
+      }
+      return 0;
+    };
+
+    const parseDate = (val: any): Date => {
+      if (!val) return new Date(0);
+      if (val instanceof Date) return val;
+      if (val?.toDate) return val.toDate();
+      return new Date(val);
+    };
 
     const recentInvoices = recentInvoicesSnap.docs.map((docSnap) => {
       const data = docSnap.data();
@@ -899,6 +1013,39 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
       } as any as Challan;
     });
 
+    // Aggregate totals (best effort; fall back to a scan if invoice fields are stored as strings)
+    const [totalsAgg, monthlyAgg] = await Promise.all([
+      withRetry('aggregate totals', async () => {
+        const snap = await getAggregateFromServer(query(invoicesCol), {
+          sales: sum('grandTotal'),
+          cgst: sum('cgstAmount'),
+          sgst: sum('sgstAmount'),
+          igst: sum('igstAmount'),
+        });
+        return snap.data() as any;
+      }).catch((err) => {
+        console.warn('Dashboard aggregate totals failed; will fall back if needed.', err);
+        return { sales: 0, cgst: 0, sgst: 0, igst: 0 };
+      }),
+      withRetry('aggregate monthly', async () => {
+        const monthQuery = query(
+          invoicesCol,
+          where('createdAt', '>=', monthStartTs),
+          where('createdAt', '<', nextMonthStartTs)
+        );
+        const snap = await getAggregateFromServer(monthQuery, {
+          sales: sum('grandTotal'),
+          cgst: sum('cgstAmount'),
+          sgst: sum('sgstAmount'),
+          igst: sum('igstAmount'),
+        });
+        return snap.data() as any;
+      }).catch((err) => {
+        console.warn('Dashboard aggregate monthly failed; will fall back if needed.', err);
+        return { sales: 0, cgst: 0, sgst: 0, igst: 0 };
+      }),
+    ]);
+
     const recentCustomerIds = [
       ...recentInvoices.map((i: any) => i.customerId).filter(Boolean),
       ...recentChallans.map((c: any) => c.customerId).filter(Boolean),
@@ -907,10 +1054,72 @@ export async function getDashboardSnapshot(): Promise<DashboardSnapshot> {
     const customers = await getCustomersByIds(recentCustomerIds);
     const customersById = Object.fromEntries(customers.map((c) => [c.id, c]));
 
-    const totalSales = Number(totalsAgg.sales ?? 0) || 0;
-    const totalGST = Number(totalsAgg.cgst ?? 0) + Number(totalsAgg.sgst ?? 0) + Number(totalsAgg.igst ?? 0);
-    const monthlySales = Number(monthlyAgg.sales ?? 0) || 0;
-    const monthlyGST = Number(monthlyAgg.cgst ?? 0) + Number(monthlyAgg.sgst ?? 0) + Number(monthlyAgg.igst ?? 0);
+    let totalSales = Number(totalsAgg.sales ?? 0) || 0;
+    let totalGST = (Number(totalsAgg.cgst ?? 0) || 0) + (Number(totalsAgg.sgst ?? 0) || 0) + (Number(totalsAgg.igst ?? 0) || 0);
+    let monthlySales = Number(monthlyAgg.sales ?? 0) || 0;
+    let monthlyGST = (Number(monthlyAgg.cgst ?? 0) || 0) + (Number(monthlyAgg.sgst ?? 0) || 0) + (Number(monthlyAgg.igst ?? 0) || 0);
+
+    const recentSales = recentInvoices.reduce((s, inv: any) => s + computeInvoiceTotal(inv), 0);
+    const recentGst = recentInvoices.reduce((s, inv: any) => s + computeInvoiceGST(inv), 0);
+    const recentMonthly = recentInvoices.reduce(
+      (acc, inv: any) => {
+        const d = parseDate(inv.invoiceDate || inv.date || inv.createdAt);
+        if (d >= monthStart && d < nextMonthStart) {
+          acc.sales += computeInvoiceTotal(inv);
+          acc.gst += computeInvoiceGST(inv);
+        }
+        return acc;
+      },
+      { sales: 0, gst: 0 }
+    );
+
+    const needsTotalsFallback =
+      invoicesCount > 0 &&
+      totalSales === 0 &&
+      totalGST === 0 &&
+      (recentSales > 0 || recentGst > 0);
+
+    const needsMonthlyFallback =
+      invoicesCount > 0 &&
+      monthlySales === 0 &&
+      monthlyGST === 0 &&
+      (recentMonthly.sales > 0 || recentMonthly.gst > 0);
+
+    if (needsTotalsFallback || needsMonthlyFallback) {
+      let scanTotalSales = 0;
+      let scanTotalGST = 0;
+      let scanMonthlySales = 0;
+      let scanMonthlyGST = 0;
+
+      let last: QueryDocumentSnapshot<DocumentData> | null = null;
+      const pageSize = 500;
+      while (true) {
+        const pageQuery: Query<DocumentData> = last
+          ? query(invoicesCol, orderBy('createdAt', 'asc'), startAfter(last), limit(pageSize))
+          : query(invoicesCol, orderBy('createdAt', 'asc'), limit(pageSize));
+        const pageSnap = await withRetry('scan invoices for dashboard totals', () => getDocs(pageQuery));
+        for (const docSnap of pageSnap.docs) {
+          const inv = docSnap.data();
+          const invTotal = computeInvoiceTotal(inv);
+          const invGst = computeInvoiceGST(inv);
+          scanTotalSales += invTotal;
+          scanTotalGST += invGst;
+
+          const d = parseDate(inv.invoiceDate || inv.date || inv.createdAt);
+          if (d >= monthStart && d < nextMonthStart) {
+            scanMonthlySales += invTotal;
+            scanMonthlyGST += invGst;
+          }
+        }
+        if (pageSnap.docs.length < pageSize) break;
+        last = pageSnap.docs[pageSnap.docs.length - 1];
+      }
+
+      totalSales = scanTotalSales;
+      totalGST = scanTotalGST;
+      monthlySales = scanMonthlySales;
+      monthlyGST = scanMonthlyGST;
+    }
 
     return {
       counts: { customers: customersCount, challans: challansCount, invoices: invoicesCount },
